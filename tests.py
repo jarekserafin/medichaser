@@ -38,7 +38,6 @@ from medichaser import (
     main,
 )
 from notifications import (
-    gotify_notify,
     pushbullet_notify,
     pushover_notify,
     telegram_notify,
@@ -106,8 +105,11 @@ class TestAuthenticator:
         monkeypatch.setattr("medichaser.log", mock_log)
         monkeypatch.setattr("medichaser.time.time", lambda: 1000)
         monkeypatch.setattr("medichaser.TOKEN_PATH", mock_token_path)
+        mock_write_private_json = Mock()
+        monkeypatch.setattr("medichaser.write_private_json", mock_write_private_json)
 
         auth = Authenticator("test_user", "test_pass")
+        mock_write_private_json.reset_mock()
         auth.tokenR = "test_refresh_token"
         auth.session = mock_session
 
@@ -120,16 +122,13 @@ class TestAuthenticator:
         }
         mock_session.post.return_value = mock_response
 
-        # Mock file operations
-        mock_token_path.parent.mkdir = Mock()
-        mock_token_path.write_text = Mock()
-
         auth.refresh_token()
 
         assert auth.tokenA == "new_access_token"
         assert auth.tokenR == "new_refresh_token"
         assert auth.expires_at == 4600  # 1000 + 3600
         assert auth.headers["Authorization"] == "Bearer new_access_token"
+        mock_write_private_json.assert_called_once()
 
     def test_refresh_token_invalid_grant(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Test refresh_token with invalid grant error."""
@@ -182,8 +181,9 @@ class TestAuthenticator:
         """Test _get_or_create_device_id when no file exists."""
         mock_device_id_path = Mock()
         mock_device_id_path.exists.return_value = False
-        mock_device_id_path.write_text = Mock()
         monkeypatch.setattr("medichaser.DEVICE_ID_PATH", mock_device_id_path)
+        mock_write_private_json = Mock()
+        monkeypatch.setattr("medichaser.write_private_json", mock_write_private_json)
         mock_uuid = Mock()
         mock_uuid.uuid4.return_value = "new-device-id"
         monkeypatch.setattr("medichaser.uuid", mock_uuid)
@@ -192,7 +192,9 @@ class TestAuthenticator:
         auth = Authenticator("user", "pass")
 
         assert auth.device_id == "new-device-id"
-        mock_device_id_path.write_text.assert_called_once()
+        mock_write_private_json.assert_called_once_with(
+            mock_device_id_path, {"device_id": "new-device-id"}
+        )
 
     def test_get_or_create_device_id_file_exists(
         self, monkeypatch: pytest.MonkeyPatch
@@ -217,9 +219,10 @@ class TestAuthenticator:
         mock_device_id_path = Mock()
         mock_device_id_path.exists.return_value = True
         mock_device_id_path.read_text.return_value = "not a json"
-        mock_device_id_path.write_text = Mock()
         monkeypatch.setattr("medichaser.DEVICE_ID_PATH", mock_device_id_path)
         monkeypatch.setattr("medichaser.log", mock_log)
+        mock_write_private_json = Mock()
+        monkeypatch.setattr("medichaser.write_private_json", mock_write_private_json)
         mock_uuid = Mock()
         mock_uuid.uuid4.return_value = "new-device-id-after-corruption"
         monkeypatch.setattr("medichaser.uuid", mock_uuid)
@@ -228,7 +231,9 @@ class TestAuthenticator:
 
         assert auth.device_id == "new-device-id-after-corruption"
         mock_log.warning.assert_called()
-        mock_device_id_path.write_text.assert_called_once()
+        mock_write_private_json.assert_called_once_with(
+            mock_device_id_path, {"device_id": "new-device-id-after-corruption"}
+        )
 
     def test_load_token_from_storage_no_file(
         self, monkeypatch: pytest.MonkeyPatch
@@ -457,7 +462,10 @@ class TestAppointmentFinder:
 
         assert result == {"data": "test_data"}
         mock_session.get.assert_called_once_with(
-            "http://test.com", headers={"test": "header"}, params={"param": "value"}
+            "http://test.com",
+            headers={"test": "header"},
+            params={"param": "value"},
+            timeout=30,
         )
 
     def test_http_get_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -475,7 +483,9 @@ class TestAppointmentFinder:
         result = finder.http_get("http://test.com", {"param": "value"})
 
         assert result == {}
-        mock_log.error.assert_called_once_with("Error 500: Internal Server Error")
+        mock_log.error.assert_called_once_with(
+            "Error %s while calling Medicover API.", 500
+        )
 
     def test_find_appointments_basic(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Test basic appointment finding."""
@@ -1120,85 +1130,6 @@ class TestNotificationFunctions:
 
         mock_print.assert_called_once()
         assert "XMPP notifications require" in mock_print.call_args[0][0]
-
-    def test_gotify_notify_success(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Test successful Gotify notification."""
-        mock_environ: dict[str, str] = {
-            "GOTIFY_HOST": "http://localhost:8080",
-            "GOTIFY_TOKEN": "test_token",
-            "GOTIFY_PRIORITY": "5",
-        }
-        mock_requests = Mock()
-        mock_requests.post.return_value = Mock()
-
-        monkeypatch.setattr("notifications.environ", mock_environ)
-        monkeypatch.setattr("notifications.requests", mock_requests)
-
-        gotify_notify("Test message", "Test title")
-
-        mock_requests.post.assert_called_once_with(
-            "http://localhost:8080/message?token=test_token",
-            json={"message": "Test message", "priority": 5, "title": "Test title"},
-        )
-
-    def test_gotify_notify_missing_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Test Gotify notification with missing environment variables."""
-        mock_environ: dict[str, str] = {}
-        mock_print = Mock()
-
-        monkeypatch.setattr("notifications.environ", mock_environ)
-        monkeypatch.setattr("builtins.print", mock_print)
-
-        gotify_notify("Test message")
-
-        mock_print.assert_called_once()
-        assert "GOTIFY notifications require" in mock_print.call_args[0][0]
-
-    def test_gotify_notify_default_priority(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """Test Gotify notification with default priority."""
-        mock_environ: dict[str, str] = {
-            "GOTIFY_HOST": "http://localhost:8080",
-            "GOTIFY_TOKEN": "test_token",
-        }
-        mock_requests = Mock()
-        mock_requests.post.return_value = Mock()
-
-        monkeypatch.setattr("notifications.environ", mock_environ)
-        monkeypatch.setattr("notifications.requests", mock_requests)
-
-        gotify_notify("Test message")
-
-        mock_requests.post.assert_called_once_with(
-            "http://localhost:8080/message?token=test_token",
-            json={"message": "Test message", "priority": 5, "title": "medihunter"},
-        )
-
-    def test_gotify_notify_request_exception(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """Test Gotify notification with request exception."""
-        mock_environ = {
-            "GOTIFY_HOST": "http://localhost:8080",
-            "GOTIFY_TOKEN": "test_token",
-        }
-        mock_requests = Mock()
-        mock_requests.post.side_effect = requests.exceptions.RequestException(
-            "Connection error"
-        )
-        mock_requests.exceptions = requests.exceptions
-        mock_print = Mock()
-
-        monkeypatch.setattr("notifications.environ", mock_environ)
-        monkeypatch.setattr("notifications.requests", mock_requests)
-        monkeypatch.setattr("builtins.print", mock_print)
-
-        gotify_notify("Test message")
-
-        mock_print.assert_called_once()
-        assert "GOTIFY notification failed" in mock_print.call_args[0][0]
-
 
 class TestExceptions:
     """Test cases for custom exceptions."""

@@ -15,7 +15,7 @@ The application is designed to be run in a Docker container and includes a `ttyd
 
 - Search for appointments by region, specialty, clinic, doctor, date range, and language at a configurable interval.
 - Handles Multi-Factor Authentication (MFA).
-- Sends notifications via Gotify, Telegram, Pushbullet, Pushover, Prowl and XMPP.
+- Sends notifications via Telegram, Pushbullet, Pushover, Prowl and XMPP.
 - Remote management through an integrated `ttyd` web terminal.
 - Persistent data storage for sessions, tokens, and logs.
 - Bullet proof design - created for long runs.
@@ -70,7 +70,9 @@ The included `ttyd` service provides command-line access to the container via a 
 
 5. **Access the web terminal:**
 
-    Navigate to `http://localhost:7681`.
+    Navigate to `http://localhost:7681`. The compose file binds this port to
+    `127.0.0.1` by default; use SSH tunneling, VPN, or a reverse proxy with
+    authentication if you need remote access.
 
 ---
 
@@ -141,7 +143,7 @@ All commands are run from the web terminal.
 - **Continuous monitoring and notifications**:
 
     ```bash
-    python medichaser.py find-appointment -r 204 -s 132 -i 15 -n gotify -t "Pediatra Warszawa"
+    python medichaser.py find-appointment -r 204 -s 132 -i 15 -n telegram -t "Pediatra Warszawa"
     ```
 
     To run the monitoring process in the background within the web terminal, you can use `screen`:
@@ -167,12 +169,6 @@ All commands are run from the web terminal.
 ## Notifications Setup
 
 Add the required environment variables for your preferred service to the `.env` file.
-
-### Gotify
-
-- `GOTIFY_HOST`: Your server URL (e.g., `http://gotify.example.com:8080`).
-- `GOTIFY_TOKEN`: Your app token.
-- `GOTIFY_PRIORITY` (Optional): Default is `5`.
 
 ### Telegram
 
@@ -206,8 +202,15 @@ The integrated `ttyd` web terminal provides convenient access to the container's
 
 You can secure `ttyd` by:
 
+- **Keeping it local-only**: The default Compose configuration binds port `7681`
+  to `127.0.0.1`, so it is only reachable from the host running Docker.
 - **Using `ttyd`'s built-in authentication**: Change default CMD to enable basic authentication when running container.
+- **Using `TTYD_CREDENTIAL`**: Set `TTYD_CREDENTIAL=username:password` in your
+  environment to enable `ttyd` basic authentication in the provided image.
 - **Using a reverse proxy**: Place a reverse proxy like Nginx or Traefik in front of the `ttyd` service to handle authentication and SSL/TLS termination.
+
+The app stores Medicover refresh tokens in `/app/data`. Keep the Docker volume
+private and avoid sharing logs or backups from that directory.
 
 ---
 

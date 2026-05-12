@@ -10,14 +10,13 @@ on:
       - main
 
 permissions:
-  actions: write
   contents: read
 
 jobs:
   type_check:
     strategy:
       matrix:
-        check: ["ruff check", "mypy --check", "ruff format --check"]
+        check: ["ruff check", "mypy", "ruff format --check"]
 
     runs-on: ubuntu-latest
     steps:

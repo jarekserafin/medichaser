@@ -16,6 +16,7 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+from html import escape
 from os import environ
 
 import requests
@@ -26,6 +27,8 @@ from xmpp import xmpp
 pushbullet = get_notifier("pushbullet")
 pushover = get_notifier("pushover")
 telegram = get_notifier("telegram")
+
+NOTIFICATION_TIMEOUT = 10
 
 
 def prowl_notify(message: str, title: str | None = None) -> None:
@@ -80,8 +83,9 @@ def pushover_notify(message: str, title: str | None = None) -> None:
 
 def telegram_notify(message: str, title: str | None = None) -> None:
     try:
+        message = escape(message)
         if title:
-            message = f"<b>{title}</b>\n{message}"
+            message = f"<b>{escape(title)}</b>\n{message}"
 
         r = telegram.notify(message=message, parse_mode="html")
     except BadArguments as e:
@@ -118,32 +122,3 @@ def xmpp_notify(message: str) -> None:
             f"XMPP notifications require NOTIFIERS_XMPP_JID, NOTIFIERS_XMPP_PASSWORD"
             f" and NOTIFIERS_XMPP_RECEIVER to be exported. Detailed exception:\n{e}"
         )
-
-
-def gotify_notify(message: str, title: str | None = None) -> None:
-    try:
-        host = environ["GOTIFY_HOST"]
-        token = environ["GOTIFY_TOKEN"]
-    except KeyError as e:
-        print(
-            f"GOTIFY notifications require GOTIFY_HOST (base url with port),"
-            f" GOTIFY_TOKEN to be exported. Detailed exception:\n{e}"
-        )
-        return
-
-    try:
-        prio = int(environ["GOTIFY_PRIORITY"])
-    except (KeyError, ValueError):
-        prio = 5
-
-    if title is None:
-        title = "medihunter"
-
-    try:
-        requests.post(
-            host + "/message?token=" + token,
-            json={"message": message, "priority": int(prio), "title": title},
-        )
-
-    except requests.exceptions.RequestException as e:
-        print(f"GOTIFY notification failed:\n{e}")

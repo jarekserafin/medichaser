@@ -27,10 +27,9 @@ import json
 import logging
 import os
 import pathlib
-import random
 import re
+import secrets
 import select
-import string
 import sys
 import time
 import uuid
@@ -56,7 +55,6 @@ from selenium_stealth import stealth
 from urllib3.util import Retry
 
 from notifications import (
-    gotify_notify,
     prowl_notify,
     pushbullet_notify,
     pushover_notify,
@@ -76,6 +74,7 @@ LOG_FILE = DATA_PATH / "medichaser.log"
 MEDICOVER_LOGIN_URL = "https://login-online24.medicover.pl"
 MEDICOVER_MAIN_URL = "https://online24.medicover.pl"
 MEDICOVER_API_URL = "https://api-gateway-online24.medicover.pl"
+REQUEST_TIMEOUT = 30
 
 DEFAULT_SLOT_SEARCH_TYPE: int = 0
 
@@ -100,6 +99,26 @@ logging.basicConfig(
 )
 
 log = logging.getLogger("medichaser")
+
+
+def write_private_json(path: pathlib.Path, data: dict[str, Any]) -> None:
+    """Write sensitive JSON files with owner-only permissions."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        path.parent.chmod(0o700)
+    except PermissionError:
+        log.debug("Could not chmod %s", path.parent)
+
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(json.dumps(data, indent=4))
+    path.chmod(0o600)
+
+
+def sanitize_url_for_log(url: str) -> str:
+    parsed = urlparse(url)
+    return f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+
 
 retry_strategy = Retry(
     total=10,
@@ -161,15 +180,15 @@ class Authenticator:
                 device_id_data = json.loads(DEVICE_ID_PATH.read_text())
                 device_id = device_id_data.get("device_id")
                 if device_id:
-                    log.info(f"Using existing device ID: {device_id}")
+                    log.info("Using existing device ID.")
                     return device_id  # type: ignore[no-any-return]
             except (json.JSONDecodeError, KeyError) as e:
                 log.warning(
                     f"Could not read device ID file, creating a new one. Error: {e}"
                 )
         device_id = str(uuid.uuid4())
-        log.info(f"Creating and saving new device ID: {device_id}")
-        DEVICE_ID_PATH.write_text(json.dumps({"device_id": device_id}))
+        log.info("Creating and saving new device ID.")
+        write_private_json(DEVICE_ID_PATH, {"device_id": device_id})
         return device_id
 
     def _get_or_create_ua(self) -> str:
@@ -179,7 +198,7 @@ class Authenticator:
                 device_ua_data = json.loads(DEVICE_UA_PATH.read_text())
                 device_ua = device_ua_data.get("device_ua")
                 if device_ua:
-                    log.info(f"Using existing device UA: {device_ua}")
+                    log.info("Using existing device UA.")
                     return device_ua  # type: ignore[no-any-return]
             except (json.JSONDecodeError, KeyError) as e:
                 log.warning(
@@ -188,8 +207,8 @@ class Authenticator:
         ua = UserAgent(os="Linux")
 
         device_ua = ua.random
-        log.info(f"Creating and saving new device UA: {device_ua}")
-        DEVICE_UA_PATH.write_text(json.dumps({"device_ua": device_ua}))
+        log.info("Creating and saving new device UA.")
+        write_private_json(DEVICE_UA_PATH, {"device_ua": device_ua})
         return device_ua
 
     def _load_token_from_storage(self) -> bool:
@@ -228,9 +247,7 @@ class Authenticator:
 
         # Step 1: Initial GET to get cookies and CSRF token
         # PKCE (Proof Key for Code Exchange) Flow
-        code_verifier = "".join(
-            random.choice(string.ascii_uppercase + string.digits) for _ in range(50)
-        )
+        code_verifier = secrets.token_urlsafe(64)
         code_challenge = (
             base64.urlsafe_b64encode(hashlib.sha256(code_verifier.encode()).digest())
             .decode()
@@ -259,6 +276,7 @@ class Authenticator:
             params=params,
             headers=self.headers,
             allow_redirects=False,
+            timeout=REQUEST_TIMEOUT,
         )
         response.raise_for_status()
         next_url = response.headers.get("Location")
@@ -267,7 +285,10 @@ class Authenticator:
         time.sleep(2)
 
         response = self.session.get(
-            next_url, headers=self.headers, allow_redirects=False
+            next_url,
+            headers=self.headers,
+            allow_redirects=False,
+            timeout=REQUEST_TIMEOUT,
         )
         # Extract CSRF token from the HTML form
         match = re.search(
@@ -275,9 +296,7 @@ class Authenticator:
             response.text,
         )
         if not match:
-            raise ValueError(
-                "Could not find CSRF token in login page: " + response.text
-            )
+            raise ValueError("Could not find CSRF token in login page.")
         csrf_token = match.group(1)
         parsed_url = urlparse(response.url)
         query_params = parse_qs(parsed_url.query)
@@ -306,9 +325,12 @@ class Authenticator:
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
             },
             allow_redirects=False,  # We want to handle redirects manually
+            timeout=REQUEST_TIMEOUT,
         )
         log.info(
-            f"Login response status: {response.status_code}, text: {response.text}, URL: {response.url}"
+            "Login response status: %s, URL: %s",
+            response.status_code,
+            sanitize_url_for_log(response.url),
         )
 
         # Step 3: Handle redirects and potential MFA
@@ -319,7 +341,7 @@ class Authenticator:
             if not redirect_url.startswith("https://"):
                 redirect_url = MEDICOVER_LOGIN_URL + redirect_url
 
-            log.info(f"Redirecting to: {redirect_url}")
+            log.info("Redirecting to: %s", sanitize_url_for_log(redirect_url))
 
             # Check if redirect is to MFA
             if "mfa" in redirect_url.lower():
@@ -330,7 +352,10 @@ class Authenticator:
             time.sleep(2)
             # Follow the redirect
             response = self.session.get(
-                redirect_url, headers=self.headers, allow_redirects=False
+                redirect_url,
+                headers=self.headers,
+                allow_redirects=False,
+                timeout=REQUEST_TIMEOUT,
             )
 
             # Check if we have the final code
@@ -338,13 +363,15 @@ class Authenticator:
                 parsed_url = urlparse(redirect_url)
                 query_params = parse_qs(parsed_url.query)
                 code = query_params.get("code", [None])[0]
+                returned_state = query_params.get("state", [None])[0]
+                if returned_state != state:
+                    raise ValueError("OAuth state mismatch in redirect response.")
                 if code:
                     self._exchange_code_for_token(code, code_verifier)
                     return  # Success!
 
         # If we are here, something went wrong
         log.error(f"Login failed. Final status: {response.status_code}")
-        log.error(response.text)
         raise ValueError("Login failed after handling redirects.")
 
     def _handle_mfa(self, mfa_url: str) -> requests.Response:  # pragma: no cover
@@ -352,12 +379,13 @@ class Authenticator:
         log.info("MFA required.")
 
         # Get the MFA page
-        log.info(f"Fetching MFA page: {mfa_url}")
+        log.info("Fetching MFA page.")
         time.sleep(2)
         response = self.session.get(
             mfa_url,
             headers=self.headers,
             allow_redirects=False,
+            timeout=REQUEST_TIMEOUT,
         )
         response.raise_for_status()
 
@@ -368,12 +396,11 @@ class Authenticator:
             response.text,
         )
         if not match:
-            raise ValueError("Could not find CSRF token in mfa page: " + response.text)
+            raise ValueError("Could not find CSRF token in MFA page.")
         csrf_token = match.group(1)
 
-        log.info(f"CSRF token for MFA: {csrf_token}")
         # Extract MfaCodeId from the cookie
-        log.info("Extracting MfaCodeId from cookies: %s", self.session.cookies)
+        log.info("Extracting MfaCodeId from MFA cookie.")
 
         mfa_info_cookie_encoded = self.session.cookies.get("MfaInfo")
         if not mfa_info_cookie_encoded:
@@ -381,7 +408,6 @@ class Authenticator:
 
         mfa_info_cookie = unquote_plus(mfa_info_cookie_encoded)
 
-        log.info(f"MfaInfo cookie: {mfa_info_cookie}")
         try:
             mfa_info = json.loads(mfa_info_cookie)
             mfa_code_id = mfa_info.get("MfaCodeId")
@@ -389,7 +415,6 @@ class Authenticator:
                 raise MFAError("MfaCodeId not found in MfaInfo cookie.")
         except json.JSONDecodeError:
             raise MFAError("Could not decode MfaInfo cookie.")
-        log.info(f"MfaCodeId: {mfa_code_id}")
 
         # Prompt user for MFA code
         log.info("Please enter the MFA code sent to your device and press Enter:")
@@ -422,7 +447,7 @@ class Authenticator:
             "__RequestVerificationToken": csrf_token,
         }
 
-        log.info("Submitting MFA code: %s", mfa_data)
+        log.info("Submitting MFA code.")
         time.sleep(2)
 
         response = self.session.post(
@@ -434,9 +459,12 @@ class Authenticator:
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
             },
             allow_redirects=False,
+            timeout=REQUEST_TIMEOUT,
         )
         log.info(
-            f"MFA response status: {response.status_code}, text: {response.text}, URL: {response.url}, headers: {response.headers}"
+            "MFA response status: %s, URL: %s",
+            response.status_code,
+            sanitize_url_for_log(response.url),
         )
         response.raise_for_status()
         return response
@@ -461,6 +489,7 @@ class Authenticator:
                 **self.headers,
                 "Content-Type": "application/x-www-form-urlencoded",
             },
+            timeout=REQUEST_TIMEOUT,
         )
         response.raise_for_status()
 
@@ -473,8 +502,7 @@ class Authenticator:
         expires_at = int(time.time()) + expires_in if expires_in else None
         data["expires_at"] = expires_at
 
-        TOKEN_PATH.parent.mkdir(parents=True, exist_ok=True)
-        TOKEN_PATH.write_text(json.dumps(data, indent=4))
+        write_private_json(TOKEN_PATH, data)
 
         self.tokenA = data.get("access_token")
         self.tokenR = data.get("refresh_token")
@@ -535,10 +563,10 @@ class Authenticator:
             ].replace("HeadlessChrome", "Chrome")
             self.headers["User-Agent"] = ua
 
-            log.info(f"Creating and saving new device UA: {ua}")
-            DEVICE_UA_PATH.write_text(json.dumps({"device_ua": ua}))
+            log.info("Creating and saving new device UA.")
+            write_private_json(DEVICE_UA_PATH, {"device_ua": ua})
 
-            log.info(f"Using User-Agent: {ua}")
+            log.info("Using Selenium User-Agent.")
 
         assert self.driver is not None
         return self.driver
@@ -581,6 +609,7 @@ class Authenticator:
             data=refresh_token_data,
             headers=self.headers,
             allow_redirects=False,
+            timeout=REQUEST_TIMEOUT,
         )
 
         data = response.json()
@@ -596,7 +625,8 @@ class Authenticator:
                     "Invalid grant: refresh token is likely expired or revoked."
                 )
             raise ValueError(
-                f"Failed to refresh token: {response.status_code} {data.get('error_description', response.text)}"
+                f"Failed to refresh token: {response.status_code} "
+                f"{data.get('error_description', 'no error description')}"
             )
 
         # manually set expires_at
@@ -604,8 +634,7 @@ class Authenticator:
         expires_at = int(time.time()) + expires_in if expires_in else None
         data["expires_at"] = expires_at
 
-        TOKEN_PATH.parent.mkdir(parents=True, exist_ok=True)
-        TOKEN_PATH.write_text(json.dumps(data, indent=4))
+        write_private_json(TOKEN_PATH, data)
 
         self.tokenA = data.get("access_token")
         self.tokenR = data.get("refresh_token")
@@ -624,8 +653,7 @@ class Authenticator:
                 return False
 
             token_json = json.loads(token_data)
-            TOKEN_PATH.parent.mkdir(parents=True, exist_ok=True)
-            TOKEN_PATH.write_text(json.dumps(token_json, indent=4))
+            write_private_json(TOKEN_PATH, token_json)
 
             self.tokenA = token_json.get("access_token")
             self.tokenR = token_json.get("refresh_token")
@@ -635,7 +663,6 @@ class Authenticator:
             return True
         except Exception as e:
             log.error(f"Error retrieving token from localStorage: {e}")
-            log.error(driver.page_source)
             return False
 
     def login_selenium(self) -> None:  # pragma: no cover
@@ -658,7 +685,6 @@ class Authenticator:
             )
         except Exception:
             log.error("Page did not redirect to a known login or home URL.")
-            log.error(driver.page_source)
             self._quit_driver()
             raise
 
@@ -710,7 +736,6 @@ class Authenticator:
             login_button.click()
         except Exception as e:
             log.error(f"Error during login form submission: {e}")
-            log.error(driver.page_source)
             self._quit_driver()
             raise
 
@@ -724,7 +749,6 @@ class Authenticator:
             )
         except Exception:
             log.error("Did not redirect to MFA or home page.")
-            log.error(driver.page_source)
             self._quit_driver()
             raise
 
@@ -777,7 +801,6 @@ class Authenticator:
             mfa_button.click()
         except Exception as e:
             log.error(f"Error clicking MFA button: {e}")
-            log.error(driver.page_source)
             self._quit_driver()
             raise MFAError("Failed to submit MFA code.")
 
@@ -796,14 +819,16 @@ class AppointmentFinder:
         self.headers = headers
 
     def http_get(self, url: str, params: dict[str, Any]) -> dict[str, Any]:
-        response = self.session.get(url, headers=self.headers, params=params)
+        response = self.session.get(
+            url, headers=self.headers, params=params, timeout=REQUEST_TIMEOUT
+        )
         if response.status_code in [401, 403]:
             log.error("Unauthorized access error: refreshing token.")
             raise ExpiredToken("Access token expired or invalid")
         elif response.status_code == 200:
             return cast(dict[str, Any], response.json())
         else:
-            log.error(f"Error {response.status_code}: {response.text}")
+            log.error("Error %s while calling Medicover API.", response.status_code)
             return {}
 
     def find_appointments(
@@ -945,8 +970,6 @@ class Notifier:
             telegram_notify(message, title)
         elif notifier == "xmpp":
             xmpp_notify(message)
-        elif notifier == "gotify":
-            gotify_notify(message, title)
         elif notifier == "prowl":
             prowl_notify(message, title)
         log.info("Notification sent successfully.")

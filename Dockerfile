@@ -30,8 +30,8 @@ FROM base AS app
 COPY --from=uv /requirements.txt /requirements.txt
 RUN pip install -r /requirements.txt
 
-# this resolves permissions issues in local env
-RUN mkdir -p /app/data && chmod 777 /app/data
+# Persistent data contains session tokens and logs.
+RUN mkdir -p /app/data && chown medichaser:medichaser /app/data && chmod 700 /app/data
 
 RUN activate-global-python-argcomplete -y
 
@@ -46,7 +46,12 @@ COPY medichaser.py notifications.py LICENSE ./
 
 EXPOSE 7681
 ENTRYPOINT ["/usr/bin/tini", "--"]
-CMD ["ttyd", "-W", "bash"]
+CMD ["bash", "-lc", "\
+if [ -n \"$TTYD_CREDENTIAL\" ]; then \
+  exec ttyd -W -c \"$TTYD_CREDENTIAL\" bash; \
+else \
+  exec ttyd -W bash; \
+fi"]
 
 FROM app AS tests
 USER root
