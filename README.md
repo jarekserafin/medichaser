@@ -164,6 +164,48 @@ All commands are run from the web terminal.
 
     For more information on using screen, check out this [guide](https://www.gnu.org/software/screen/manual/screen.html).
 
+### Monitoring Multiple Searches
+
+Create a YAML config file, for example `medichaser.yml`:
+
+```yaml
+defaults:
+  region: 204
+  interval: 15
+  notification: telegram
+
+scans:
+  - title: "Fizjo Wwa"
+    specialty: 27158
+
+  - title: "Okulista Wwa"
+    specialty: 12345
+    enddate: "2026-05-31"
+
+  - title: "Pediatra Wwa Atrium"
+    specialty: 132
+    clinic: 49284
+    language: 4
+```
+
+Then run all configured scans in one process:
+
+```bash
+python medichaser.py monitor medichaser.yml
+```
+
+Inside the Docker container, keep the config in the persistent data volume:
+
+```bash
+cp medichaser.example.yml data/medichaser.yml
+python medichaser.py monitor
+```
+
+Each scan supports the same fields as `find-appointment`: `region`, `specialty`,
+`clinic`, `doctor`, `date`, `enddate`, `notification`, `title`, `language`,
+`interval`, and `slot_search_type`. Values from `defaults` are applied to every
+scan and can be overridden per scan.
+
 ---
 
 ## Notifications Setup

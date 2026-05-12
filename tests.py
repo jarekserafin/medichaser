@@ -33,9 +33,12 @@ from medichaser import (
     MFAError,
     NextRun,
     Notifier,
+    ScanConfig,
+    load_monitor_config,
     display_appointments,
     json_date_serializer,
     main,
+    run_scan_once,
 )
 from notifications import (
     pushbullet_notify,
@@ -1145,6 +1148,75 @@ class TestExceptions:
             raise MFAError("Test MFA Error")
 
 
+def test_load_monitor_config_with_defaults(tmp_path: Any) -> None:
+    """Test YAML monitor config parsing with defaults."""
+    config_path = tmp_path / "medichaser.yml"
+    config_path.write_text(
+        """
+defaults:
+  region: 204
+  interval: 15
+  notification: telegram
+
+scans:
+  - title: "Fizjo Wwa"
+    specialty: 27158
+  - title: "Okulista Wwa"
+    specialty:
+      - 12345
+      - 67890
+    enddate: "2026-05-31"
+"""
+    )
+
+    scans = load_monitor_config(config_path)
+
+    assert len(scans) == 2
+    assert scans[0].region == 204
+    assert scans[0].specialty == [27158]
+    assert scans[0].interval == 15
+    assert scans[0].notification == "telegram"
+    assert scans[1].specialty == [12345, 67890]
+    assert scans[1].enddate == datetime.date(2026, 5, 31)
+
+
+def test_run_scan_once_sends_only_new_appointments(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Test that run_scan_once deduplicates appointments in memory."""
+    scan = ScanConfig(
+        region=204,
+        specialty=[27158],
+        title="Fizjo Wwa",
+        notification="telegram",
+    )
+    finder = MagicMock()
+    finder.find_appointments.return_value = [
+        {"id": 1, "name": "Old appointment"},
+        {"id": 2, "name": "New appointment"},
+    ]
+
+    mock_display = MagicMock()
+    monkeypatch.setattr("medichaser.display_appointments", mock_display)
+    mock_notifier = MagicMock()
+    monkeypatch.setattr("medichaser.Notifier.send_notification", mock_notifier)
+
+    appointments = run_scan_once(
+        finder,
+        scan,
+        previous_appointments=[{"id": 1, "name": "Old appointment"}],
+    )
+
+    assert appointments == [
+        {"id": 1, "name": "Old appointment"},
+        {"id": 2, "name": "New appointment"},
+    ]
+    mock_display.assert_called_once_with([{"id": 2, "name": "New appointment"}])
+    mock_notifier.assert_called_once_with(
+        "telegram", "Fizjo Wwa", appointments=[{"id": 2, "name": "New appointment"}]
+    )
+
+
 def test_main_find_appointment_single_run(monkeypatch: pytest.MonkeyPatch) -> None:
     """Test the main function for a single run of find-appointment."""
     mock_args = Namespace(
@@ -1379,6 +1451,38 @@ def test_main_find_appointment_interval_run(monkeypatch: pytest.MonkeyPatch) -> 
     mock_display.assert_any_call([{"id": 2, "name": "Appointment 2"}])
     mock_notifier.assert_any_call(
         "pushover", "Interval Test", appointments=[{"id": 2, "name": "Appointment 2"}]
+    )
+
+
+def test_main_monitor(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> None:
+    """Test the main function for monitor config dispatch."""
+    config_path = tmp_path / "medichaser.yml"
+    mock_args = Namespace(command="monitor", config=config_path)
+
+    mock_parser = MagicMock()
+    mock_parser.parse_args.return_value = mock_args
+    monkeypatch.setattr("argparse.ArgumentParser", lambda **kwargs: mock_parser)
+
+    monkeypatch.setattr(
+        "os.environ", {"MEDICOVER_USER": "user", "MEDICOVER_PASS": "pass"}
+    )
+
+    mock_auth_instance = MagicMock()
+    monkeypatch.setattr("medichaser.Authenticator", lambda u, p: mock_auth_instance)
+
+    mock_finder_instance = MagicMock()
+    monkeypatch.setattr(
+        "medichaser.AppointmentFinder", lambda s, h: mock_finder_instance
+    )
+
+    mock_run_monitor = MagicMock()
+    monkeypatch.setattr("medichaser.run_monitor", mock_run_monitor)
+
+    main()
+
+    mock_auth_instance.login.assert_called_once()
+    mock_run_monitor.assert_called_once_with(
+        mock_auth_instance, mock_finder_instance, config_path
     )
 
 

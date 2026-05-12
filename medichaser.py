@@ -33,6 +33,7 @@ import select
 import sys
 import time
 import uuid
+from dataclasses import dataclass, field
 from logging.handlers import RotatingFileHandler
 from typing import Any, cast
 from urllib.parse import parse_qs, quote_plus, unquote_plus, urlparse
@@ -40,6 +41,7 @@ from urllib.parse import parse_qs, quote_plus, unquote_plus, urlparse
 import argcomplete
 import requests
 import tenacity
+import yaml
 from dotenv import load_dotenv
 from fake_useragent import UserAgent
 from filelock import FileLock
@@ -1024,12 +1026,14 @@ class NextRun:
         self.next_run = datetime.datetime.now(tz=datetime.UTC)
         self.interval_minutes = interval_minutes
 
-    def is_time_to_run(self) -> bool:
+    def is_due(self) -> bool:
         if self.interval_minutes is None:
             return True
-        now = datetime.datetime.now(tz=datetime.UTC)
-        if now >= self.next_run:
-            self.next_run = now + datetime.timedelta(minutes=self.interval_minutes)
+        return datetime.datetime.now(tz=datetime.UTC) >= self.next_run
+
+    def is_time_to_run(self) -> bool:
+        if self.is_due():
+            self.set_next_run()
             return True
         return False
 
@@ -1039,6 +1043,271 @@ class NextRun:
         self.next_run = datetime.datetime.now(tz=datetime.UTC) + datetime.timedelta(
             minutes=self.interval_minutes
         )
+
+
+@dataclass
+class ScanConfig:
+    region: int
+    specialty: list[int]
+    title: str | None = None
+    clinic: int | None = None
+    doctor: int | None = None
+    date: datetime.date = field(default_factory=datetime.date.today)
+    enddate: datetime.date | None = None
+    notification: str | None = None
+    language: int | None = None
+    interval: int | None = None
+    slot_search_type: int | str = DEFAULT_SLOT_SEARCH_TYPE
+
+
+@dataclass
+class ScanRuntime:
+    config: ScanConfig
+    next_run: NextRun
+    previous_appointments: list[dict[str, Any]] = field(default_factory=list)
+
+
+def parse_config_date(value: Any, field_name: str) -> datetime.date | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime.datetime):
+        return value.date()
+    if isinstance(value, datetime.date):
+        return value
+    if isinstance(value, str):
+        return datetime.date.fromisoformat(value)
+    raise ValueError(f"{field_name} must be a YYYY-MM-DD date.")
+
+
+def parse_specialty(value: Any) -> list[int]:
+    if isinstance(value, int):
+        return [value]
+    if isinstance(value, list) and value and all(isinstance(x, int) for x in value):
+        return cast(list[int], value)
+    raise ValueError("specialty must be an integer or a non-empty list of integers.")
+
+
+def parse_optional_int(value: Any, field_name: str) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, int):
+        return value
+    raise ValueError(f"{field_name} must be an integer.")
+
+
+def scan_config_from_mapping(data: dict[str, Any]) -> ScanConfig:
+    try:
+        region = data["region"]
+        specialty = data["specialty"]
+    except KeyError as e:
+        raise ValueError(f"Missing required scan field: {e.args[0]}") from e
+
+    if not isinstance(region, int):
+        raise ValueError("region must be an integer.")
+
+    interval = parse_optional_int(data.get("interval"), "interval")
+    if interval is not None and interval <= 0:
+        raise ValueError("interval must be greater than 0.")
+
+    return ScanConfig(
+        region=region,
+        specialty=parse_specialty(specialty),
+        title=data.get("title"),
+        clinic=parse_optional_int(data.get("clinic"), "clinic"),
+        doctor=parse_optional_int(data.get("doctor"), "doctor"),
+        date=parse_config_date(data.get("date"), "date") or datetime.date.today(),
+        enddate=parse_config_date(data.get("enddate"), "enddate"),
+        notification=data.get("notification"),
+        language=parse_optional_int(data.get("language"), "language"),
+        interval=interval,
+        slot_search_type=parse_slot_search_type(
+            str(data.get("slot_search_type", DEFAULT_SLOT_SEARCH_TYPE))
+        ),
+    )
+
+
+def scan_config_from_args(args: argparse.Namespace) -> ScanConfig:
+    return ScanConfig(
+        region=args.region,
+        specialty=args.specialty,
+        clinic=args.clinic,
+        doctor=args.doctor,
+        date=args.date,
+        enddate=args.enddate,
+        notification=args.notification,
+        title=args.title,
+        language=args.language,
+        interval=args.interval,
+        slot_search_type=args.slot_search_type,
+    )
+
+
+def load_monitor_config(path: pathlib.Path) -> list[ScanConfig]:
+    with path.open() as f:
+        raw_config = yaml.safe_load(f) or {}
+
+    if not isinstance(raw_config, dict):
+        raise ValueError("Monitor config must be a YAML mapping.")
+
+    defaults = raw_config.get("defaults", {})
+    scans = raw_config.get("scans")
+    if not isinstance(defaults, dict):
+        raise ValueError("defaults must be a mapping.")
+    if not isinstance(scans, list) or not scans:
+        raise ValueError("scans must be a non-empty list.")
+
+    parsed_scans = []
+    for index, scan in enumerate(scans, start=1):
+        if not isinstance(scan, dict):
+            raise ValueError(f"scan #{index} must be a mapping.")
+        merged_scan = {**defaults, **scan}
+        if merged_scan.get("interval") is None:
+            merged_scan["interval"] = 60
+        try:
+            parsed_scans.append(scan_config_from_mapping(merged_scan))
+        except ValueError as e:
+            raise ValueError(f"Invalid scan #{index}: {e}") from e
+
+    return parsed_scans
+
+
+def refresh_auth_or_relogin(auth: Authenticator) -> bool:
+    try:
+        auth.refresh_token()
+    except InvalidGrantError as e:
+        log.warning(f"Token refresh failed: {e}")
+        log.info("Attempting to re-login...")
+        auth.login()
+        time.sleep(5)
+        log.info("Re-login successful, continuing...")
+        return False
+    return True
+
+
+def run_scan_once(
+    finder: AppointmentFinder,
+    scan: ScanConfig,
+    previous_appointments: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    appointments = finder.find_appointments(
+        scan.region,
+        scan.specialty,
+        scan.clinic,
+        scan.date,
+        scan.enddate,
+        scan.language,
+        scan.doctor,
+        scan.slot_search_type,
+    )
+
+    if previous_appointments:
+        new_appointments = [x for x in appointments if x not in previous_appointments]
+    else:
+        new_appointments = appointments
+
+    if scan.title:
+        log.info("Scan: %s", scan.title)
+    display_appointments(new_appointments)
+
+    if new_appointments:
+        Notifier.send_notification(
+            scan.notification, scan.title, appointments=new_appointments
+        )
+
+    return appointments
+
+
+def run_find_appointment(
+    auth: Authenticator, finder: AppointmentFinder, args: argparse.Namespace
+) -> None:
+    scan = scan_config_from_args(args)
+    if scan.interval is not None:
+        Notifier.send_notification(
+            scan.notification,
+            "Medichaser start",
+            message=f"medichaser started in interval with command: {args.command} and arguments: {json.dumps(vars(args), indent=2, default=json_date_serializer)}",
+        )
+
+    next_run = NextRun(scan.interval)
+    previous_appointments: list[dict[str, Any]] = []
+
+    try:
+        while True:
+            if not refresh_auth_or_relogin(auth):
+                continue
+
+            if not next_run.is_time_to_run():
+                time.sleep(30)
+                continue
+
+            try:
+                previous_appointments = run_scan_once(
+                    finder, scan, previous_appointments
+                )
+            except ExpiredToken as e:
+                log.warning("Expired token error: %s", e)
+                continue
+
+            if next_run.interval_minutes is None:
+                log.info("Exiting after one run due to interval set to None.")
+                break
+    except Exception as e:
+        log.error(f"Error in main loop: {e}")
+        Notifier.send_notification(
+            scan.notification,
+            "Medichaser error",
+            message=f"medichaser crashed during run:\n {e}",
+        )
+        raise
+
+
+def run_monitor(
+    auth: Authenticator, finder: AppointmentFinder, config_path: pathlib.Path
+) -> None:
+    scans = load_monitor_config(config_path)
+    runtimes = [
+        ScanRuntime(config=scan, next_run=NextRun(scan.interval)) for scan in scans
+    ]
+
+    for runtime in runtimes:
+        Notifier.send_notification(
+            runtime.config.notification,
+            "Medichaser start",
+            message=f"medichaser monitor started scan: {runtime.config.title or runtime.config.specialty}",
+        )
+
+    try:
+        while True:
+            due_scans = [runtime for runtime in runtimes if runtime.next_run.is_due()]
+            if not due_scans:
+                time.sleep(30)
+                continue
+
+            if not refresh_auth_or_relogin(auth):
+                continue
+
+            for runtime in due_scans:
+                runtime.next_run.set_next_run()
+                try:
+                    runtime.previous_appointments = run_scan_once(
+                        finder,
+                        runtime.config,
+                        runtime.previous_appointments,
+                    )
+                except ExpiredToken as e:
+                    log.warning(
+                        "Expired token error for %s: %s", runtime.config.title, e
+                    )
+                    continue
+    except Exception as e:
+        log.error(f"Error in monitor loop: {e}")
+        for runtime in runtimes:
+            Notifier.send_notification(
+                runtime.config.notification,
+                "Medichaser error",
+                message=f"medichaser monitor crashed:\n {e}",
+            )
+        raise
 
 
 def main() -> None:
@@ -1132,6 +1401,17 @@ def main() -> None:
         "-s", "--specialty", required=True, type=int, nargs="+", help="Specialty ID(s)"
     )
 
+    monitor = subparsers.add_parser(
+        "monitor", help="Run multiple appointment scans from a YAML config"
+    )
+    monitor.add_argument(
+        "config",
+        nargs="?",
+        default=DATA_PATH / "medichaser.yml",
+        type=pathlib.Path,
+        help="Path to YAML config file with scan definitions. Default: data/medichaser.yml",
+    )
+
     argcomplete.autocomplete(parser)
     args = parser.parse_args()
 
@@ -1157,83 +1437,10 @@ def main() -> None:
     finder = AppointmentFinder(auth.session, auth.headers)
 
     if args.command == "find-appointment":
-        if args.interval is not None:
-            Notifier.send_notification(
-                args.notification,
-                "Medichaser start",
-                message=f"medichaser started in interval with command: {args.command} and arguments: {json.dumps(vars(args), indent=2, default=json_date_serializer)}",
-            )
+        run_find_appointment(auth, finder, args)
 
-        next_run = NextRun(args.interval)
-        previous_appointments: list[dict[str, Any]] = []
-
-        try:
-            while True:
-                # Authenticate
-                try:
-                    auth.refresh_token()
-                except InvalidGrantError as e:
-                    log.warning(f"Token refresh failed: {e}")
-                    log.info("Attempting to re-login...")
-                    auth.login()
-                    time.sleep(5)
-                    log.info("Re-login successful, continuing...")
-                    continue
-
-                if not next_run.is_time_to_run():
-                    time.sleep(30)
-                    continue
-
-                next_run.set_next_run()
-
-                # Find appointments
-                try:
-                    appointments = finder.find_appointments(
-                        args.region,
-                        args.specialty,
-                        args.clinic,
-                        args.date,
-                        args.enddate,
-                        args.language,
-                        args.doctor,
-                        args.slot_search_type,
-                    )
-                except ExpiredToken as e:
-                    log.warning("Expired token error: %s", e)
-                    continue
-
-                # Find new appointments
-                if previous_appointments:
-                    new_appointments = [
-                        x for x in appointments if x not in previous_appointments
-                    ]
-                else:
-                    new_appointments = appointments
-
-                previous_appointments = appointments
-
-                # Display appointments
-                display_appointments(new_appointments)
-
-                # Send notification if appointments are found
-                if new_appointments:
-                    Notifier.send_notification(
-                        args.notification, args.title, appointments=new_appointments
-                    )
-
-                if next_run.interval_minutes is None:
-                    log.info("Exiting after one run due to interval set to None.")
-                    break
-
-                continue
-        except Exception as e:
-            log.error(f"Error in main loop: {e}")
-            Notifier.send_notification(
-                args.notification,
-                "Medichaser error",
-                message=f"medichaser crashed during run:\n {e}",
-            )
-            raise
+    elif args.command == "monitor":
+        run_monitor(auth, finder, args.config)
 
     elif args.command == "list-filters":
         # Authenticate

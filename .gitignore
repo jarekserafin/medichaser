@@ -117,3 +117,5 @@ visits.db.dir
 
 #local runs
 /appointments.json
+/medichaser.yml
+docs.md

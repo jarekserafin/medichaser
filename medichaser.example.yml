@@ -1,0 +1,17 @@
+defaults:
+  region: 204
+  interval: 15
+  notification: telegram
+
+scans:
+  - title: "Fizjo Wwa"
+    specialty: 27158
+
+  - title: "Okulista Wwa"
+    specialty: 12345
+    enddate: "2026-05-31"
+
+  - title: "Pediatra Wwa Atrium"
+    specialty: 132
+    clinic: 49284
+    language: 4
